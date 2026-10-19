@@ -11,8 +11,20 @@ import numpy as np
 from torchvision.transforms import transforms
 import wfdb
 import torch
-import ecg_plot
-import yaml
+# 注：原文件在此 import ecg_plot / yaml，但二者在本文件中从未被使用（真实用法在 draw_figures/draw_ecg.py）。
+# 它们会给最小 demo 引入两个非必需的脆弱依赖，且 ecg_plot 会连带拉入 opencv，故移除。
+
+
+def _ecg_device():
+    """ECG 张量该放的设备。
+
+    原代码在这里硬编码 `ecg.to("cuda")`，等价于写死 cuda:0，有两个问题：
+      1. 单卡多进程 / 非 0 号卡（CUDA_VISIBLE_DEVICES 之外的场景）会放错设备；
+      2. 没有 GPU 的环境（本地烟测、纯 CPU 调试）直接崩。
+    实际上 `ecg_llm.py` 的 forward 里本来就会做 `ecg.to(input_ids.device)`，
+    所以这里只要放到一个「有 GPU 就用 GPU、否则 CPU」的设备即可，语义不变。
+    """
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @dataclass
@@ -123,13 +135,16 @@ class DataCollatorForSeq2Seq:
                     path = feature['ecg']
                     ecg = wfdb.rdsamp(path)[0]
                     ecg = ecg.T
-                    ecg[torch.where(torch.isnan(ecg))] = 0
-                    ecg[torch.where(torch.isinf(ecg))] = 0
+                    # 修复：此处 ecg 仍是 numpy 数组，而 torch.isnan/isinf 要求 Tensor。
+                    # 原写法会抛 TypeError: isnan(): argument 'input' (position 1) must be
+                    # Tensor, not numpy.ndarray（已在 torch 1.4.0 与 2.13.0 上复现验证）。
+                    # 改用 numpy 侧清理，语义不变；mimic 分支无需改动（那里已是 Tensor）。
+                    ecg = np.nan_to_num(ecg, nan=0.0, posinf=0.0, neginf=0.0)
 
                     ecg = Transforms(ecg)
                     ecg = torch.squeeze(ecg, dim=0)
 
-                    feature['ecg'] = ecg.to("cuda")
+                    feature['ecg'] = ecg.to(_ecg_device())
 
         # print('feature[ecg] #################', feature['ecg'].device)
         # print('feature[input_ids] #################', feature['input_ids'].device)
@@ -269,13 +284,16 @@ class DataCollatorForSeq2Seq_for_robutness_test:
                     path = feature['ecg']
                     ecg = wfdb.rdsamp(path)[0]
                     ecg = ecg.T
-                    ecg[torch.where(torch.isnan(ecg))] = 0
-                    ecg[torch.where(torch.isinf(ecg))] = 0
+                    # 修复：此处 ecg 仍是 numpy 数组，而 torch.isnan/isinf 要求 Tensor。
+                    # 原写法会抛 TypeError: isnan(): argument 'input' (position 1) must be
+                    # Tensor, not numpy.ndarray（已在 torch 1.4.0 与 2.13.0 上复现验证）。
+                    # 改用 numpy 侧清理，语义不变；mimic 分支无需改动（那里已是 Tensor）。
+                    ecg = np.nan_to_num(ecg, nan=0.0, posinf=0.0, neginf=0.0)
 
                     ecg = Transforms(ecg)
                     ecg = torch.squeeze(ecg, dim=0)
 
-                    feature['ecg'] = ecg.to("cuda")
+                    feature['ecg'] = ecg.to(_ecg_device())
 
         # print('feature[ecg] #################', feature['ecg'].device)
         # print('feature[input_ids] #################', feature['input_ids'].device)

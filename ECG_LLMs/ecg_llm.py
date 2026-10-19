@@ -113,6 +113,17 @@ class ECG_LLM_ForCausalLM(nn.Module):
                 self.args.ecg_model_ckpt_path,
                 map_location=torch.device("cpu"),
                  )
+            # 修复：训练侧保存的 ecg_model.pth 来自 save_with_accelerate() → get_state_dict()，
+            # 里面保留了 "ecg_model." 前缀（如 'ecg_model.ecg_encoder.conv1.weight'），
+            # 而这里期望的是 ECG_model 自身的 key（'ecg_encoder.conv1.weight'），
+            # 直接 load_state_dict 会报 "Missing key(s) / Unexpected key(s)"。
+            # 因此先识别并去掉前缀（两种格式都兼容）。
+            if ecg_model_checkpoint and all(
+                str(k).startswith("ecg_model.") for k in ecg_model_checkpoint
+            ):
+                ecg_model_checkpoint = {
+                    str(k)[len("ecg_model."):]: v for k, v in ecg_model_checkpoint.items()
+                }
             self.ecg_model = ECG_model(args=self.args)
             self.ecg_model.load_state_dict(ecg_model_checkpoint)
 
@@ -349,7 +360,13 @@ class ECG_LLM_ForCausalLM(nn.Module):
         elif self.args.train_or_test == 'test': ####### using the finetuned lora module
 
 
-            device_map = "balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
+            # 修复：原写法末尾多了一个逗号，`device_map` 实际是个 tuple ("auto",)，
+            # 传给 from_pretrained 会被 accelerate 当成非法的 device_map。
+            # 另外 CPU-only 环境下 device_map=None 更稳妥。
+            if not torch.cuda.is_available():
+                device_map = None
+            else:
+                device_map = "balanced_low_0" if torch.cuda.device_count() > 1 else "auto"
 
             torch_dtype = "auto"
 
@@ -454,7 +471,7 @@ class ECG_LLM_ForCausalLM(nn.Module):
 
             proj_ecg_emb = self.ecg_model(ecg, input_ids)
 
-            breakpoint()
+            # breakpoint()
 
         elif self.args.train_or_test == 'test':
             self.ecg_model = self.ecg_model.to(input_ids.device)
@@ -488,28 +505,62 @@ class ECG_LLM_ForCausalLM(nn.Module):
         self,
         input_ids=None,
         ecg=None,
-    ):  
+        max_length=128,
+    ):
+        """贪心解码（等价于原 generate 的 do_sample=False / num_beams=1）。
+
+        为什么不再走 `self.llm_model.generate(...)`：
+        `models/modeling_ecg_gpt2.py` 里那份自定义 `generate()` 是从 transformers
+        **4.37/4.38** 整段拷贝过来的（其中调用 `GenerationMixin._get_generation_mode`，
+        且 `_get_logits_processor` 需要 `negative_prompt_ids`）。而本仓库
+        `requirements.txt` 写的是 4.43.4，4.39 起该逻辑已迁到
+        `GenerationConfig.get_generation_mode`。拷贝版 generate 与新版 mixin 混用会连环报：
+            AttributeError: 'GPT2LMHeadModel' object has no attribute '_get_generation_mode'
+            AttributeError: 'GenerationConfig' object has no attribute '_eos_token_tensor'
+        逐个打补丁是无底洞。这里直接复用模型自己的 `forward`（ECG 注入本来就在
+        forward 里完成），因此既不依赖那份拷贝，也不依赖 transformers 各版本的
+        生成内部实现，接口保持不变。
+
+        行为说明：
+          - 逐 step 取 argmax（贪心），不采样、不带 beam；
+          - 达到 eos 的序列用 eos 填充，全部结束后提前退出；
+          - 返回形状与原来一致：`[batch, prompt_len + new_len]`（含 prompt）。
+        """
         d_type = next(self.llm_model.parameters()).dtype
         self.ecg_model = self.ecg_model.to(input_ids.device).to(d_type)
 
         ecg = ecg.to(input_ids.device).to(d_type)
 
         proj_ecg_emb = self.ecg_model(ecg, input_ids)
-        proj_ecg_emb = normalize(proj_ecg_emb, dim=-1)# batch 128
-  
-        output_ids = self.llm_model.generate(
-           ecg_emb=proj_ecg_emb,
-           ecg_layer_idxs=self.ecg_layer_idxs,
-           input_ids=input_ids,
-           generation_config = GenerationConfig(
-            # use_cache=True is required, the rest can be changed up.
-           max_length = 128,
-           num_beams = 1,
-           num_beam_groups = 1,
-           do_sample = False,
-        )
-        )
-        return output_ids
+        proj_ecg_emb = normalize(proj_ecg_emb, dim=-1)  # batch, proj_out
+
+        ids = input_ids
+        max_new = max(1, int(max_length) - int(input_ids.shape[1]))
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        finished = torch.zeros(ids.shape[0], dtype=torch.bool, device=ids.device)
+
+        for _ in range(max_new):
+            outputs = self.llm_model(
+                input_ids=ids,
+                ecg_emb=proj_ecg_emb,
+                ecg_layer_idxs=self.ecg_layer_idxs,
+                use_cache=False,
+            )
+            next_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if eos_id is not None:
+                # 已经结束的序列继续填 eos，避免把后续 token 也算进去
+                next_id = torch.where(
+                    finished[:, None],
+                    torch.full_like(next_id, int(eos_id)),
+                    next_id,
+                )
+                finished = finished | (next_id.squeeze(1) == int(eos_id))
+            ids = torch.cat([ids, next_id], dim=1)
+            if eos_id is not None and bool(finished.all()):
+                break
+
+        return ids
+
 
 
     

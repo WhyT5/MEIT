@@ -48,8 +48,19 @@ import nltk
 
 from nltk.translate.meteor_score import meteor_score
 from nltk import word_tokenize
-nltk.download('wordnet')
-nltk.download('punkt')
+
+# 兼容性/健壮性修复：原代码在 **import 期** 无条件调用 nltk.download('wordnet'/'punkt')。
+# 这两个包只有 compute_metric_scores() 里算 METEOR 时才用到，但 import 训练脚本就会触发；
+# 在没有外网（或 nltk 默认源 raw.githubusercontent.com 不可达）的机器上，会阻塞数分钟
+# 才超时 —— 本地实测 **import 一次耗时 7 分 4 秒**，全部是网络等待。
+# 改成默认不联网：需要 METEOR 时自行预下载，或设 MEIT_DOWNLOAD_NLTK=1 让它按需下载。
+if os.environ.get("MEIT_DOWNLOAD_NLTK", "0") == "1":
+    for _pkg in ("wordnet", "punkt"):
+        try:
+            nltk.download(_pkg, quiet=True, raise_on_error=False)
+        except Exception as _e:  # 网络不可达时不要阻断训练
+            print(f"[eval_metrics] nltk.download({_pkg}) 失败（不影响训练损失）: {_e}")
+
 from bert_score import score
 ################ modify the code here #######################
 

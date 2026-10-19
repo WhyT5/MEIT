@@ -42,7 +42,27 @@ from transformers.utils import (
 )
 from transformers.utils.import_utils import is_torch_fx_available
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import _get_unpad_data, _expand_mask, _make_causal_mask, \
+# 兼容性修复：`_get_unpad_data` / `_expand_mask` / `_make_causal_mask` 在较新的 transformers
+# 里已从 `models.llama.modeling_llama` 移走。实测 transformers==4.43.4 会报：
+#   ImportError: cannot import name '_get_unpad_data' from
+#                'transformers.models.llama.modeling_llama'
+# 新位置：
+#   _get_unpad_data                -> transformers.modeling_flash_attention_utils
+#   _make_causal_mask/_expand_mask -> transformers.modeling_attn_mask_utils.AttentionMaskConverter
+# 上游 MEIT 是按旧版 transformers 写的，这里做成两版都能 import。
+# 注意：本 demo 走 GPT-2 路径，这些符号只在 LLaMA 分支被用到，且两版签名兼容。
+try:
+    from transformers.models.llama.modeling_llama import (
+        _get_unpad_data, _expand_mask, _make_causal_mask,
+    )
+except ImportError:  # transformers >= ~4.41
+    from transformers.modeling_flash_attention_utils import _get_unpad_data
+    from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+
+    _make_causal_mask = AttentionMaskConverter._make_causal_mask
+    _expand_mask = AttentionMaskConverter._expand_mask
+
+from transformers.models.llama.modeling_llama import \
 LlamaRMSNorm, LlamaRotaryEmbedding, LlamaLinearScalingRotaryEmbedding, LlamaDynamicNTKScalingRotaryEmbedding, LlamaMLP
 
 if is_flash_attn_2_available():
