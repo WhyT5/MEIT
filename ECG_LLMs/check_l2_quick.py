@@ -34,6 +34,17 @@ from ecg_llm import ECG_LLM_ForCausalLM  # noqa: E402
 FIXED_USER_PROMPT = "generate a description of the ECG embeddings: "
 
 
+def _default_base_model():
+    """优先用同级目录下的 gpt2_medium_local（离线可用），否则回退到 HF 名字。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "..", "gpt2_medium_local"),
+                 os.path.join(here, "gpt2_medium_local")):
+        cand = os.path.abspath(cand)
+        if os.path.exists(os.path.join(cand, "config.json")):
+            return cand
+    return "gpt2-medium"
+
+
 def build_args(ckpt_dir, base_model, cache_dir, llm_type, ecg_model_type):
     cfg = AutoConfig.from_pretrained(base_model, cache_dir=cache_dir)
     tokenizer = AutoTokenizer.from_pretrained(base_model, cache_dir=cache_dir, use_fast=False)
@@ -62,7 +73,8 @@ def main():
     ap.add_argument("--demo_dir", default="demo_data_de_2k")
     ap.add_argument("--split", default="val")
     ap.add_argument("--num", type=int, default=32)
-    ap.add_argument("--base_model", default="gpt2-medium")
+    ap.add_argument("--base_model", default=_default_base_model(),
+                    help="默认自动探测同级的 gpt2_medium_local")
     ap.add_argument("--llm_type", default="gpt2_medium")
     ap.add_argument("--ecg_model_type", default="ResNet50")
     _hf = os.environ.get("HF_HOME")
@@ -88,8 +100,11 @@ def main():
     collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=None,
                                       padding="longest", ecg_data_name="ptbxl")
     prefix = f"<|user|>\n{FIXED_USER_PROMPT}\n<|assistant|>\n"
+    # 设备必须统一：ECG_model.forward 用 input_ids.device 去搬特征张量，
+    # 若 input_ids 在 CPU、ecg 在 GPU，就会把特征搬回 CPU 而 proj 层在 GPU → 报 mixed device。
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     prompt_ids = tokenizer(prefix, return_tensors="pt", max_length=128,
-                           truncation=True).input_ids
+                           truncation=True).input_ids.to(device)
 
     embs, acc_ecg, acc_zero, top5_ecg, n = [], 0, 0, 0, 0
     with torch.no_grad():
@@ -103,7 +118,7 @@ def main():
             feat = {"input_ids": prompt_ids.flatten(), "labels": prompt_ids.flatten(),
                     "attention_mask": torch.ones_like(prompt_ids).flatten(),
                     "ecg": r["ecg_path"]}
-            ecg = collator([feat])["ecg"].to(next(model.llm_model.parameters()).device)
+            ecg = collator([feat])["ecg"].to(device)
 
             # A. 嵌入
             e = model.ecg_model(ecg, prompt_ids)
